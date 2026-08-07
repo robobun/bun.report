@@ -348,8 +348,13 @@ const EMBEDDED_TMP_RE = /^\.(?:(.+)\.)?[0-9a-f]{4,16}-[0-9A-F]{1,8}\.(node|so|dy
 
 export function normalizeModuleName(object: string): string {
   const m = object.match(EMBEDDED_TMP_RE);
-  if (m) return m[1] ? `${m[1]}.${m[2]}` : `embedded .${m[2]}`;
-  return object;
+  if (!m) return object;
+  if (!m[1]) return `embedded .${m[2]}`;
+  // The stem usually ends with the bundler's `[name]-[hash]` asset suffix —
+  // exactly 8 chars of its base32 alphabet (bun_core::fmt::truncated_hash32).
+  // Strip it so one addon is one identity across app rebuilds.
+  const stem = m[1].replace(/-[0-9abcdefghjkmnpqrstvwxyz]{8}$/, "");
+  return `${stem}.${m[2]}`;
 }
 
 // Objects that aren't real foreign modules: bun's own image, JS frames, and

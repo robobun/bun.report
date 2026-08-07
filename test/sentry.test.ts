@@ -88,7 +88,9 @@ describe("normalizeModuleName", () => {
     [".dafb37e78ed77f3f-0.node", "embedded .node"],
     [".ab12cd34-1F.node", "embedded .node"],
     [".dafb37e78ed77f3f-0.dll", "embedded .dll"],
-    // stem-carrying temp names (newer builds)
+    // stem-carrying temp names (newer builds); the stem itself ends with the
+    // bundler's 8-char base32 asset hash, which must not affect identity
+    [".my_native_addon-msn58fw9.c7a034da05c78833-0.node", "my_native_addon.node"],
     [".better_sqlite3.dafb37e78ed77f3f-0.node", "better_sqlite3.node"],
     [".my-lib.1a2b3c4d5e6f7a8b-2.so", "my-lib.so"],
     // everything else passes through

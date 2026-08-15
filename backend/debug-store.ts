@@ -13,13 +13,20 @@ import type { ResolvedCommit } from "../lib";
 import { octokit } from "./git";
 import type { FeatureConfig } from "./feature";
 import { AsyncMutexMap } from "./mutex";
+import { readExecutableDebugId, selectDebugFile, type DebugFileCheck } from "./debug-id";
 
 export const cache_root = join(import.meta.dir, "..", ".cache");
 
-interface DebugInfo {
+export interface DebugInfo {
   file_path: string;
   feature_config: FeatureConfig;
+  /** The arch whose artifact this is. Differs from the trace's arch when a sibling link matched. */
+  arch: Arch;
+  /** Read from the executable in the artifact; undefined when it could not be. */
+  debug_id: string | undefined;
 }
+
+export type SelectedDebugInfo = DebugInfo & DebugFileCheck;
 
 export function storeRoot(platform: Platform, arch: Arch, is_canary: boolean | undefined) {
   return join(cache_root, platform + "-" + arch + (is_canary ? "-canary" : ""));
@@ -49,7 +56,25 @@ const map_download_os = {
   freebsd: "freebsd",
 } as const;
 
+/**
+ * The debug file to symbolize a trace with. Without a `debug_id` (trace
+ * formats 1-3) that is the artifact named by the trace's arch, as it always
+ * was. With one, the artifact is checked against it and the commit's sibling
+ * links are tried when it does not match; see `selectDebugFile`.
+ */
 export async function fetchDebugFile(
+  os: Platform,
+  arch: Arch,
+  commit: ResolvedCommit,
+  is_canary: boolean | undefined,
+  debug_id?: string,
+): Promise<SelectedDebugInfo> {
+  return selectDebugFile(arch, debug_id, (candidate) =>
+    fetchArtifact(os, candidate, commit, is_canary),
+  );
+}
+
+async function fetchArtifact(
   os: Platform,
   arch: Arch,
   commit: ResolvedCommit,
@@ -74,15 +99,17 @@ async function fetchDebugFileWithoutCache(
   is_canary: boolean | undefined,
   store_suffix: string,
   path: string,
-) {
+): Promise<DebugInfo> {
   const oid = commit.oid;
 
-  const cached_path = getCachedDebugFile(os, arch, oid);
-  if (cached_path) {
+  const cached = getCachedDebugFile(os, arch, oid);
+  if (cached) {
     const feature_config = getCachedFeatureData(oid, is_canary)!;
     return {
-      file_path: cached_path,
+      file_path: cached.file_path,
       feature_config: feature_config,
+      arch,
+      debug_id: cached.debug_id,
     };
   }
 
@@ -93,6 +120,7 @@ async function fetchDebugFileWithoutCache(
   }
 
   let feature_config: FeatureConfig;
+  let debug_id: string | undefined;
 
   try {
     if (process.env.NODE_ENV === "development") {
@@ -172,6 +200,14 @@ async function fetchDebugFileWithoutCache(
       throw new Error(`Failed to find ${relative(tmp.path, desired_file)} in extraction`);
     }
 
+    // The zip also holds the executable the debug file belongs to (the same
+    // link users run, so it carries the same id a v4 trace reports). Read the
+    // id before the debug file is moved out; on Linux they are the same file.
+    const executable = entries.find(
+      (entry) => entry === "bun-profile" || entry === "bun-profile.exe",
+    );
+    debug_id = executable ? readExecutableDebugId(join(tmp.path, dir, executable)) : undefined;
+
     await mkdir(dirname(path), { recursive: true });
     await rename(desired_file, path);
 
@@ -188,7 +224,7 @@ async function fetchDebugFileWithoutCache(
     feature_config ??=
       getCachedFeatureData(oid, is_canary) ?? (await fetchFeatureData(oid, is_canary));
 
-    putCachedDebugFile(os, arch, oid, path);
+    putCachedDebugFile(os, arch, oid, path, debug_id);
   } catch (e) {
     await rm(path, { force: true });
     throw e;
@@ -197,6 +233,8 @@ async function fetchDebugFileWithoutCache(
   return {
     file_path: path,
     feature_config,
+    arch,
+    debug_id,
   };
 }
 

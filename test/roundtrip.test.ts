@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { parse } from "../lib/parser";
 import { buildTraceString, encodeVlq, type BuildTraceOpts } from "./helpers/encode";
 import { decodePart } from "../lib/vlq";
+import { parseCacheKey } from "../lib/util";
 
 describe("vlq roundtrip", () => {
   for (const v of [0, 1, 2, 31, 32, 0x1234, 0x10ab34, 0x7fffffff]) {
@@ -182,6 +183,54 @@ describe("parse(buildTraceString(x)) recovers x", () => {
         values: Array.from({ length: 33 }, (_, i) => BigInt(i)),
       },
     },
+    // v4: build flags, then the debug id. A 20-byte sha1 build-id (ELF)...
+    {
+      version: "1.4.0",
+      os: "linux",
+      arch: "x86_64",
+      command: "a",
+      trace_version: "4",
+      build_flags: 1,
+      debug_id: "caac16c6401beba3fdd7e29cafe9bd212a0a23f8",
+      commitish: "2c2ef7c",
+      features: [96, 1048577],
+      addresses: [
+        { address: 0x2f864f4, object: "bun" },
+        { address: 0, object: "?" },
+        { address: 0x1234, object: "/libc.so.6" },
+      ],
+      reason: { kind: "panic", message: "invoked crashByPanic() handler" },
+    },
+    // ...a 16-byte PDB GUID (Windows), release build, with a foreign frame
+    // after the id to show the VLQ stream is still aligned...
+    {
+      version: "1.4.0",
+      os: "windows",
+      arch: "x86_64",
+      command: "t",
+      trace_version: "4",
+      build_flags: 0,
+      debug_id: "e4509f66f3b4e4984c4c44205044422e",
+      commitish: "605e221",
+      addresses: [
+        { address: 0x1111, object: "bun" },
+        { address: 0x17344, object: "KERNEL32.DLL" },
+      ],
+      reason: { kind: "segfault", addr_hi: 0, addr_lo: 0 },
+    },
+    // ...and an executable without an id (count 0), which must parse like a
+    // v3 trace minus the register block.
+    {
+      version: "1.4.0",
+      os: "macos",
+      arch: "aarch64",
+      command: "r",
+      trace_version: "4",
+      build_flags: 0,
+      commitish: "605e221",
+      addresses: [{ address: 0x1063487, object: "bun" }],
+      reason: { kind: "segfault", addr_hi: 0, addr_lo: 0xdeadbeef | 0 },
+    },
   ];
 
   for (const c of cases) {
@@ -217,6 +266,13 @@ describe("parse(buildTraceString(x)) recovers x", () => {
         expect(p.fault_address).toBe("102F864F4");
       }
 
+      if (c.trace_version === "4" && c.debug_id) {
+        expect(p.debug_id).toBe(c.debug_id);
+      } else {
+        expect(p.debug_id).toBeUndefined();
+      }
+      if (c.trace_version === "4") expect(p.fault_registers).toBeUndefined();
+
       if (c.registers) {
         expect(p.fault_registers).toBeDefined();
         expect(p.fault_registers!.pc).toEqual(c.registers.pc);
@@ -228,4 +284,54 @@ describe("parse(buildTraceString(x)) recovers x", () => {
       }
     });
   }
+});
+
+describe("v4 debug id field", () => {
+  const base = {
+    version: "1.4.0",
+    os: "linux",
+    arch: "x86_64",
+    command: "a",
+    trace_version: "4",
+    build_flags: 0,
+    commitish: "2c2ef7c",
+    addresses: [{ address: 0x42, object: "bun" }],
+    reason: { kind: "oom" },
+  } as const satisfies BuildTraceOpts;
+
+  test("a truncated id is rejected rather than read into the following fields", async () => {
+    const full = buildTraceString({ ...base, debug_id: "00112233445566778899aabbccddeeff" });
+    // Drop two hex digits: the declared count (16 bytes) now overruns into the
+    // features VLQs, which are not hex.
+    const cut = full.replace("ccddeeff", "ccddee");
+    expect(await parse(cut)).toBeNull();
+  });
+
+  test("non-hex where the id should be is rejected", async () => {
+    const s = buildTraceString({ ...base, debug_id: "00112233445566778899aabbccddeeff" }).replace("aabb", "AABB");
+    expect(await parse(s)).toBeNull();
+  });
+
+  test("an absurd byte count is rejected", async () => {
+    // Same layout as the helper writes, but with a hand-written count.
+    const prefix = "1.4.0/la4" + base.commitish + encodeVlq(0);
+    expect(await parse(prefix + encodeVlq(100) + "00".repeat(100) + encodeVlq(0) + encodeVlq(0) + encodeVlq(0) + "9")).toBeNull();
+  });
+
+  test("is_canary comes from the build flags", async () => {
+    expect((await parse(buildTraceString({ ...base, build_flags: 1 })))!.is_canary).toBe(true);
+    expect((await parse(buildTraceString({ ...base, build_flags: 0 })))!.is_canary).toBe(false);
+  });
+
+  test("traces that differ only in debug id get different remap cache keys", async () => {
+    const a = (await parse(buildTraceString({ ...base, debug_id: "00".repeat(16) })))!;
+    const b = (await parse(buildTraceString({ ...base, debug_id: "ff".repeat(16) })))!;
+    const none = (await parse(buildTraceString(base)))!;
+    expect(parseCacheKey(a)).not.toBe(parseCacheKey(b));
+    expect(parseCacheKey(a)).not.toBe(parseCacheKey(none));
+    // A v1 trace of the same commit and addresses keys exactly as it did
+    // before the field existed.
+    const v1 = (await parse(buildTraceString({ ...base, trace_version: "1" })))!;
+    expect(parseCacheKey(v1)).toBe(parseCacheKey(none));
+  });
 });

@@ -235,7 +235,14 @@ function cardFooter() {
     ? `<a href="https://github.com/oven-sh/bun/commit/${oid}" target="_blank">${parsed.commitish}</a>`
     : parsed.commitish;
 
-  const arch = parsed.arch.split("_baseline");
+  const arch = (fetched?.arch ?? parsed.arch).split("_baseline");
+
+  const debug_file =
+    fetched?.debug_file === "mismatch"
+      ? /* html */ `
+        <p class='error'>No published build of this commit has this binary's debug id (<code>${parsed.debug_id}</code>), so the addresses above are not symbolicated.</p>
+      `
+      : "";
 
   const features = fetched?.features
     ? /* html */ `
@@ -249,6 +256,7 @@ function cardFooter() {
       on ${os_names[parsed.os[0]]} ${arch[0]} ${arch.length > 1 ? "(baseline)" : ""}
     </p>
     ${features}
+    ${debug_file}
   `;
 }
 

@@ -2,10 +2,10 @@ import type { Parse, Remap, ResolvedCommit } from "../lib/parser";
 import { getCommit } from "./git";
 import { fetchDebugFile } from "./debug-store";
 import { getCachedRemap, putCachedRemap } from "./db";
-import { parseCacheKey } from "../lib/util";
+import { parseCacheKey, type Arch } from "../lib/util";
 import { llvm_symbolizer, pdb_addr2line } from "./system-deps";
 import { formatMarkdown } from "./markdown";
-import { decodeFeatures } from "./feature";
+import { decodeFeatures, type FeatureConfig } from "./feature";
 import { AsyncMutexMap } from "./mutex";
 import { adjustBunAddresses, processSymbolizerOutput, filterAddresses } from "./symbolize";
 
@@ -78,12 +78,17 @@ export async function remapUncached(
     throw e;
   }
 
-  const debug_info = opts.exe
+  const debug_info: {
+    file_path: string;
+    feature_config: FeatureConfig | null;
+    arch?: Arch;
+    debug_file?: Remap["debug_file"];
+  } = opts.exe
     ? {
         file_path: opts.exe,
         feature_config: null,
       }
-    : await fetchDebugFile(parse.os, parse.arch, commit, parse.is_canary);
+    : await fetchDebugFile(parse.os, parse.arch, commit, parse.is_canary, parse.debug_id);
 
   if (!debug_info) {
     const e: any = new Error(`Could not find debug file for ${parse.os}-${parse.arch} for commit ${parse.commitish}`);
@@ -94,7 +99,11 @@ export async function remapUncached(
   let stdout = "";
 
   const bun_addrs = adjustBunAddresses(parse.addresses, parse.os);
-  if (bun_addrs.length > 0) {
+  // A mismatch means no published link of this commit is the binary that
+  // crashed; its debug info describes different code at these addresses, so
+  // the frames stay raw (processSymbolizerOutput with no output) instead of
+  // being remapped into plausible-looking nonsense.
+  if (bun_addrs.length > 0 && debug_info.debug_file !== "mismatch") {
     const cmd = [
       parse.os === "windows" ? pdb_addr2line : llvm_symbolizer,
       "--exe",
@@ -139,15 +148,17 @@ export async function remapUncached(
     ? "StandaloneExecutable"
     : (command_map[parse.command] ?? parse.command);
 
-  const remap = {
+  const remap: Remap = {
     version: display_version,
     message: parse.message,
     os: parse.os,
-    arch: parse.arch,
+    arch: debug_info.arch ?? parse.arch,
     commit: commit,
     addresses: mapped_addrs,
     command,
     features,
+    ...(parse.debug_id ? { debug_id: parse.debug_id } : {}),
+    ...(debug_info.debug_file ? { debug_file: debug_info.debug_file } : {}),
   };
   putCachedRemap(key, remap);
 

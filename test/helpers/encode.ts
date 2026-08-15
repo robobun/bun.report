@@ -87,10 +87,15 @@ export interface BuildTraceOpts {
   os: Platform;
   arch: Arch;
   command: string;
-  trace_version: "1" | "2" | "3";
+  trace_version: "1" | "2" | "3" | "4";
   commitish: string;
   /** v3+ build-flags VLQ (bit0 = canary). */
   build_flags?: number;
+  /**
+   * v4: the executable's debug id as lowercase hex; encoded as a VLQ byte count
+   * followed by the hex. Omit for an executable without one (count 0).
+   */
+  debug_id?: string;
   features?: [number, number];
   addresses: ParsedAddress[];
   reason: ReasonSpec;
@@ -107,7 +112,13 @@ export function buildTraceString(opts: BuildTraceOpts): string {
   s += opts.command;
   s += opts.trace_version;
   s += opts.commitish;
-  if (opts.trace_version === "3") s += encodeVlq(opts.build_flags ?? 0);
+  if (opts.trace_version === "3" || opts.trace_version === "4")
+    s += encodeVlq(opts.build_flags ?? 0);
+  if (opts.trace_version === "4") {
+    const debug_id = opts.debug_id ?? "";
+    if (debug_id.length % 2 !== 0) throw new Error("debug_id must be whole bytes");
+    s += encodeVlq(debug_id.length / 2) + debug_id;
+  }
   s += encodeVlq(f0) + encodeVlq(f1);
   for (const a of opts.addresses) s += encodeStackLine(a);
   s += encodeVlq(0);

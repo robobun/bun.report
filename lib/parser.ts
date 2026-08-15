@@ -26,11 +26,24 @@ const platform_map: { [key: string]: [Platform, Arch] } = {
 };
 
 /**
- * Real ids are 16 bytes (PDB GUID, Mach-O UUID) or 20 (sha1 build-id); bun
- * itself caps at 20 (`debug_id::MAX_LEN`). The bound here only exists to
- * reject a corrupt string instead of slicing a huge "id" out of it.
+ * Tags of the format-4 header fields (`HeaderField` in bun's
+ * src/crash_handler/lib.rs). Unknown tags are skipped, so bun can add fields
+ * without a new version char; add the tag here once we want to read one.
  */
-const max_debug_id_bytes = 64;
+const header_field = {
+  /** One VLQ; bit 0 = canary. */
+  build_flags: 0,
+  /** The executable's debug id as lowercase hex. Absent when it has none. */
+  debug_id: 1,
+} as const;
+
+/**
+ * A header field's chars. A debug id is at most 40 chars (a 20-byte sha1
+ * build-id); the bound only exists so a corrupt count cannot swallow the rest
+ * of the string as one field.
+ */
+const max_header_field_chars = 256;
+const max_header_fields = 32;
 
 const reasons: {
   [key: string]: (fault_address: string | undefined, rest: string) => string | Promise<string>;
@@ -101,10 +114,10 @@ export interface Parse {
    * v4+: the id the linker stamped into both the crashing executable and its
    * debug info (PDB GUID on Windows, GNU build-id on ELF, LC_UUID on Mach-O),
    * as lowercase hex in the byte order the platform's tools print it. Unlike
-   * `commitish` + `arch` it names one specific link: a commit can be published
-   * as several links of one platform (x64 and x64-baseline, or a re-run
-   * release step), and the addresses only remap against the matching one.
-   * Absent for older formats and for executables that carry no id.
+   * `commitish` + `arch` it names one specific build: the glibc, musl and
+   * android builds of a commit all report the same platform char, and the
+   * addresses only remap against the one that was actually running. Absent
+   * for older formats and for executables that carry no id.
    */
   debug_id?: string;
 }
@@ -138,24 +151,26 @@ export interface Remap {
   message: string;
   version: string;
   os: Platform;
-  /**
-   * The arch whose debug file the addresses were remapped with. Normally the
-   * trace's own arch; for a v4 trace it is whichever x64 link of the commit
-   * carries the trace's debug id.
-   */
   arch: Arch;
   commit: ResolvedCommit;
   addresses: Address[];
   issue?: number;
   command: string;
   features: string[];
+  /**
+   * Which of the commit's builds for this os/arch the addresses were remapped
+   * with: "musl", "android" or "baseline"; absent for the plain build. Traces
+   * without a debug id always use the plain build (or, for the old baseline
+   * platform chars, the baseline one), so this only varies for v4 traces.
+   */
+  variant?: string;
   /** See `Parse.debug_id`. */
   debug_id?: string;
   /**
    * v4 traces only. "match": the debug file carries the trace's debug id.
-   * "mismatch": no published link of this commit does, so `addresses` were
-   * deliberately left unsymbolicated rather than remapped against the wrong
-   * binary. "unverified": the debug file's own id could not be read.
+   * "mismatch": none of the commit's published builds does, so `addresses`
+   * were deliberately left unsymbolicated rather than remapped against the
+   * wrong binary. "unverified": the debug file's own id could not be read.
    */
   debug_file?: "match" | "mismatch" | "unverified";
 }
@@ -194,8 +209,8 @@ export interface RemapAPIResponse {
   command: string;
   version: string;
   features: string[];
-  /** See `Remap.arch`; absent from responses of older servers. */
-  arch?: Arch;
+  /** See `Remap.variant`. */
+  variant?: string;
   /** See `Remap.debug_file`. */
   debug_file?: Remap["debug_file"];
 }
@@ -223,7 +238,7 @@ export async function parse(str: string): Promise<Parse | null> {
 
     let is_canary = false;
     let has_build_flags = false;
-    let has_debug_id = false;
+    let has_header = false;
     let has_regs = false;
     if (trace_version === "1") {
       // '1' - original. uses 7 char hash with VLQ encoded stack-frames
@@ -237,13 +252,11 @@ export async function parse(str: string): Promise<Parse | null> {
       has_build_flags = true;
       has_regs = true;
     } else if (trace_version === "4") {
-      // '4' - '1' plus, after the sha, the build-flags VLQ of '3' and then the
-      //       executable's debug id: a VLQ byte count followed by that many
-      //       bytes as lowercase hex (count 0 = the executable has no id).
-      //       No register block. Emitted by `encode_trace_string` in bun's
-      //       src/crash_handler/lib.rs.
-      has_build_flags = true;
-      has_debug_id = true;
+      // '4' - '1' plus a header after the sha: a VLQ field count, then per
+      //       field a VLQ tag (`header_field`), a VLQ char count and that many
+      //       chars. No register block. Emitted by `encode_trace_string` in
+      //       bun's src/crash_handler/lib.rs.
+      has_header = true;
     } else {
       DEBUG && debug("invalid version '%s'", trace_version);
       return null;
@@ -266,21 +279,48 @@ export async function parse(str: string): Promise<Parse | null> {
     }
 
     let debug_id: string | undefined;
-    if (has_debug_id) {
-      const [byte_count, adv] = decodePart(str.slice(i));
-      if (byte_count == null || byte_count < 0 || byte_count > max_debug_id_bytes) {
-        DEBUG && debug("invalid debug id length %o", str.slice(i));
+    if (has_header) {
+      const [field_count, adv] = decodePart(str.slice(i));
+      if (field_count == null || field_count < 0 || field_count > max_header_fields) {
+        DEBUG && debug("invalid header field count %o", str.slice(i));
         return null;
       }
       i += adv;
-      if (byte_count > 0) {
-        const hex = str.slice(i, i + byte_count * 2);
-        if (hex.length !== byte_count * 2 || !/^[0-9a-f]+$/.test(hex)) {
-          DEBUG && debug("invalid debug id %o", hex);
+      for (let n = 0; n < field_count; n++) {
+        const [tag, tag_adv] = decodePart(str.slice(i));
+        if (tag == null || tag < 0) {
+          DEBUG && debug("invalid header field tag %o", str.slice(i));
           return null;
         }
-        i += hex.length;
-        debug_id = hex;
+        i += tag_adv;
+        const [length, length_adv] = decodePart(str.slice(i));
+        if (length == null || length < 0 || length > max_header_field_chars || i + length_adv + length > str.length) {
+          DEBUG && debug("invalid header field length %o", str.slice(i));
+          return null;
+        }
+        i += length_adv;
+        const chars = str.slice(i, i + length);
+        i += length;
+
+        switch (tag) {
+          case header_field.build_flags: {
+            const [flags, flags_adv] = decodePart(chars);
+            if (flags == null || flags_adv !== chars.length) {
+              DEBUG && debug("invalid build_flags field %o", chars);
+              return null;
+            }
+            is_canary = !!(flags & (1 << 0));
+            break;
+          }
+          case header_field.debug_id:
+            if (chars.length === 0 || chars.length % 2 !== 0 || !/^[0-9a-f]+$/.test(chars)) {
+              DEBUG && debug("invalid debug_id field %o", chars);
+              return null;
+            }
+            debug_id = chars;
+            break;
+          // A field this decoder predates: skipped by its length.
+        }
       }
     }
 

@@ -89,18 +89,33 @@ export interface BuildTraceOpts {
   command: string;
   trace_version: "1" | "2" | "3" | "4";
   commitish: string;
-  /** v3+ build-flags VLQ (bit0 = canary). */
+  /** v3: the bare VLQ after the sha; v4: header field 0. bit0 = canary. */
   build_flags?: number;
-  /**
-   * v4: the executable's debug id as lowercase hex; encoded as a VLQ byte count
-   * followed by the hex. Omit for an executable without one (count 0).
-   */
+  /** v4: the executable's debug id as lowercase hex. Omit for an executable without one. */
   debug_id?: string;
+  /**
+   * v4: header fields appended after the ones bun emits today, e.g. a tag this
+   * decoder does not know, to exercise the skip path.
+   */
+  extra_header_fields?: [tag: number, chars: string][];
   features?: [number, number];
   addresses: ParsedAddress[];
   reason: ReasonSpec;
   /** v3+, fault reasons only. */
   registers?: { pc: ParsedAddress | null; values: bigint[] };
+}
+
+/** The format-4 header, in the order bun's `encode_trace_string` writes it. */
+export function encodeHeader(
+  opts: Pick<BuildTraceOpts, "build_flags" | "debug_id" | "extra_header_fields">,
+): string {
+  const fields: [tag: number, chars: string][] = [[0, encodeVlq(opts.build_flags ?? 0)]];
+  if (opts.debug_id !== undefined) fields.push([1, opts.debug_id]);
+  fields.push(...(opts.extra_header_fields ?? []));
+  return (
+    encodeVlq(fields.length) +
+    fields.map(([tag, chars]) => encodeVlq(tag) + encodeVlq(chars.length) + chars).join("")
+  );
 }
 
 export function buildTraceString(opts: BuildTraceOpts): string {
@@ -112,13 +127,8 @@ export function buildTraceString(opts: BuildTraceOpts): string {
   s += opts.command;
   s += opts.trace_version;
   s += opts.commitish;
-  if (opts.trace_version === "3" || opts.trace_version === "4")
-    s += encodeVlq(opts.build_flags ?? 0);
-  if (opts.trace_version === "4") {
-    const debug_id = opts.debug_id ?? "";
-    if (debug_id.length % 2 !== 0) throw new Error("debug_id must be whole bytes");
-    s += encodeVlq(debug_id.length / 2) + debug_id;
-  }
+  if (opts.trace_version === "3") s += encodeVlq(opts.build_flags ?? 0);
+  if (opts.trace_version === "4") s += encodeHeader(opts);
   s += encodeVlq(f0) + encodeVlq(f1);
   for (const a of opts.addresses) s += encodeStackLine(a);
   s += encodeVlq(0);

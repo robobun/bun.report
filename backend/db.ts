@@ -2,7 +2,7 @@
 // This is used to avoid remapping the same address multiple times.
 import { Database } from "bun:sqlite";
 import type { Remap } from "../lib/parser";
-import { remapCacheKey, type Arch, type Platform } from "../lib/util";
+import { remapCacheKey, type Platform } from "../lib/util";
 import { rm } from "node:fs/promises";
 import { relative } from "node:path";
 import type { FeatureConfig } from "./feature";
@@ -111,12 +111,13 @@ export interface CachedDebugFile {
   debug_id: string | undefined;
 }
 
+/** `name` is debug-store's `cacheName()`: the arch for a commit's plain build, arch plus link otherwise. */
 export function getCachedDebugFile(
   os: Platform,
-  arch: Arch,
+  name: string,
   commit: string,
 ): CachedDebugFile | null {
-  const cache_key = `${os}-${arch}-${commit}`;
+  const cache_key = `${os}-${name}-${commit}`;
   const result = get_debug_file_stmt.get(cache_key) as {
     file_path: string;
     debug_id: string | null;
@@ -130,12 +131,12 @@ export function getCachedDebugFile(
 
 export function putCachedDebugFile(
   os: Platform,
-  arch: Arch,
+  name: string,
   commit: string,
   file_path: string,
   debug_id: string | undefined,
 ) {
-  insert_debug_file_stmt.run(`${os}-${arch}-${commit}`, file_path, debug_id ?? null, Date.now());
+  insert_debug_file_stmt.run(`${os}-${name}-${commit}`, file_path, debug_id ?? null, Date.now());
 }
 
 export function getCachedFeatureData(

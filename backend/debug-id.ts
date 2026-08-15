@@ -1,5 +1,5 @@
 import { closeSync, openSync, readSync } from "node:fs";
-import type { Arch } from "../lib/util";
+import type { Arch, Platform } from "../lib/util";
 
 // Deliberately free of backend imports (db, git, ...) so the selection policy
 // below is unit-testable; debug-store.ts supplies the downloading.
@@ -10,46 +10,75 @@ export interface DebugFileCheck {
 }
 
 /**
- * The other links a commit may be published as for the same os. A v4 trace
- * says `'w'` for both Windows x64 links of a commit when the build that made
- * it did not know which zip it would ship in, so the debug id decides.
+ * One published build of a commit: the part of the artifact name between
+ * `bun-<os>-` and `-profile.zip`, e.g. "x64", "x64-musl", "aarch64-android".
  */
-const sibling_archs: Partial<Record<Arch, readonly Arch[]>> = {
-  x86_64: ["x86_64_baseline"],
-  x86_64_baseline: ["x86_64"],
-};
+export type Link = string;
+
+/**
+ * Every link a commit is published as whose crash handler reports the given
+ * platform char, the one traces have always been symbolized with first. The
+ * glibc, musl and android builds of an arch all report 'l'/'L', and a tree
+ * that still builds a separate baseline binary reports 'w'/'l'/'m' from it
+ * too, so for a trace that carries a debug id these are the candidates.
+ */
+export function publishedLinks(os: Platform, arch: Arch): Link[] {
+  const cpu = arch === "aarch64" ? "aarch64" : "x64";
+  const links: Link[] = [arch === "x86_64_baseline" ? `${cpu}-baseline` : cpu];
+  if (os === "linux") links.push(`${cpu}-musl`, `${cpu}-android`);
+  if (os !== "freebsd" && cpu === "x64")
+    links.push(arch === "x86_64_baseline" ? cpu : `${cpu}-baseline`);
+  return links;
+}
+
+/** What distinguishes a link from the plain build of its arch: "musl", "android", "baseline", or undefined. */
+export function linkVariant(link: Link): string | undefined {
+  const dash = link.indexOf("-");
+  return dash === -1 ? undefined : link.slice(dash + 1);
+}
+
+/**
+ * Cache namespace (debug-store's db rows and on-disk dirs) for one build of a
+ * commit. The build traces have always been symbolized with keeps the name the
+ * cache has always used (`x86_64`), so existing entries stay valid; the others
+ * get their own (`x86_64-x64-musl`).
+ */
+export function cacheName(os: Platform, arch: Arch, link: Link): string {
+  return link === publishedLinks(os, arch)[0] ? arch : `${arch}-${link}`;
+}
 
 function isUnavailable(e: unknown): boolean {
   return (e as any)?.code === "DebugInfoUnavailable";
 }
 
 /**
- * Which of a commit's links to symbolize a trace with. `fetch(arch)` yields
- * that arch's artifact (with the id read from its executable, if readable)
- * or throws `DebugInfoUnavailable` when the commit was not published under
- * that name.
+ * Which of a commit's links to symbolize a trace with. `fetch(link)` yields
+ * that artifact (with the id read from its executable, if readable) or throws
+ * `DebugInfoUnavailable` when the commit was not published under that name.
  *
- * - no trace id (formats 1-3): the trace's own arch, unchecked, as before.
- * - it matches the trace's arch artifact: use it.
- * - that artifact's id is unreadable: use it, flagged "unverified" (there is
- *   no evidence either way, so behave as before).
- * - otherwise try the sibling links; the one carrying the id wins and a
- *   missing sibling is skipped. When the trace's own artifact is missing
- *   altogether this is also how a trace published only under the other
- *   name gets symbolized at all.
- * - nothing carries the id: "mismatch". The caller then leaves the addresses
- *   unsymbolicated; remapping them against another link's debug info is what
- *   produced confidently wrong reports before the id existed.
+ * - no trace id (formats 1-3): the first link, unchecked, as before.
+ * - it carries the id: use it.
+ * - its id is unreadable: use it, flagged "unverified" (no evidence either
+ *   way, so behave as before).
+ * - otherwise the remaining links in turn; the one carrying the id wins and a
+ *   missing one is skipped. This is also how a trace from a build that was
+ *   only published under one of the other names gets symbolized at all.
+ * - nothing carries the id: "mismatch", with the first link. The caller then
+ *   leaves the addresses unsymbolicated; remapping them against another
+ *   build's debug info is what produced confidently wrong reports before the
+ *   id existed.
  */
 export async function selectDebugFile<T extends { debug_id: string | undefined }>(
+  os: Platform,
   arch: Arch,
   debug_id: string | undefined,
-  fetch: (arch: Arch) => Promise<T>,
+  fetch: (link: Link) => Promise<T>,
 ): Promise<T & DebugFileCheck> {
+  const [first, ...rest] = publishedLinks(os, arch);
   let primary: T | undefined;
   let primary_error: unknown;
   try {
-    primary = await fetch(arch);
+    primary = await fetch(first);
   } catch (e) {
     if (debug_id === undefined || !isUnavailable(e)) throw e;
     primary_error = e;
@@ -60,10 +89,10 @@ export async function selectDebugFile<T extends { debug_id: string | undefined }
     if (primary.debug_id === undefined) return { ...primary, debug_file: "unverified" };
   }
 
-  for (const sibling of sibling_archs[arch] ?? []) {
+  for (const link of rest) {
     let candidate: T;
     try {
-      candidate = await fetch(sibling);
+      candidate = await fetch(link);
     } catch (e) {
       if (isUnavailable(e)) continue;
       throw e;

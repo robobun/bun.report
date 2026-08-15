@@ -235,7 +235,8 @@ function cardFooter() {
     ? `<a href="https://github.com/oven-sh/bun/commit/${oid}" target="_blank">${parsed.commitish}</a>`
     : parsed.commitish;
 
-  const arch = (fetched?.arch ?? parsed.arch).split("_baseline");
+  const arch = parsed.arch.split("_baseline");
+  const variant = fetched?.variant ? `(${fetched.variant})` : arch.length > 1 ? "(baseline)" : "";
 
   const debug_file =
     fetched?.debug_file === "mismatch"
@@ -253,7 +254,7 @@ function cardFooter() {
   return /* html */ `
     <p>
       Bun v${addCanarySuffix(fetched ? fetched.version : parsed.version, parsed.is_canary)} <small>(<code>${commit}</code>)</small>
-      on ${os_names[parsed.os[0]]} ${arch[0]} ${arch.length > 1 ? "(baseline)" : ""}
+      on ${os_names[parsed.os[0]]} ${arch[0]} ${variant}
     </p>
     ${features}
     ${debug_file}

@@ -2,7 +2,7 @@ import type { Parse, Remap, ResolvedCommit } from "../lib/parser";
 import { getCommit } from "./git";
 import { fetchDebugFile } from "./debug-store";
 import { getCachedRemap, putCachedRemap } from "./db";
-import { parseCacheKey, type Arch } from "../lib/util";
+import { parseCacheKey } from "../lib/util";
 import { llvm_symbolizer, pdb_addr2line } from "./system-deps";
 import { formatMarkdown } from "./markdown";
 import { decodeFeatures, type FeatureConfig } from "./feature";
@@ -81,7 +81,7 @@ export async function remapUncached(
   const debug_info: {
     file_path: string;
     feature_config: FeatureConfig | null;
-    arch?: Arch;
+    variant?: string;
     debug_file?: Remap["debug_file"];
   } = opts.exe
     ? {
@@ -152,11 +152,12 @@ export async function remapUncached(
     version: display_version,
     message: parse.message,
     os: parse.os,
-    arch: debug_info.arch ?? parse.arch,
+    arch: parse.arch,
     commit: commit,
     addresses: mapped_addrs,
     command,
     features,
+    ...(debug_info.variant ? { variant: debug_info.variant } : {}),
     ...(parse.debug_id ? { debug_id: parse.debug_id } : {}),
     ...(debug_info.debug_file ? { debug_file: debug_info.debug_file } : {}),
   };

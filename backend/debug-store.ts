@@ -13,23 +13,30 @@ import type { ResolvedCommit } from "../lib";
 import { octokit } from "./git";
 import type { FeatureConfig } from "./feature";
 import { AsyncMutexMap } from "./mutex";
-import { readExecutableDebugId, selectDebugFile, type DebugFileCheck } from "./debug-id";
+import {
+  cacheName,
+  linkVariant,
+  readExecutableDebugId,
+  selectDebugFile,
+  type DebugFileCheck,
+  type Link,
+} from "./debug-id";
 
 export const cache_root = join(import.meta.dir, "..", ".cache");
 
 export interface DebugInfo {
   file_path: string;
   feature_config: FeatureConfig;
-  /** The arch whose artifact this is. Differs from the trace's arch when a sibling link matched. */
-  arch: Arch;
+  /** Which of the commit's builds this is (see `publishedLinks`): "musl", "android", "baseline", or undefined for the plain one. */
+  variant: string | undefined;
   /** Read from the executable in the artifact; undefined when it could not be. */
   debug_id: string | undefined;
 }
 
 export type SelectedDebugInfo = DebugInfo & DebugFileCheck;
 
-export function storeRoot(platform: Platform, arch: Arch, is_canary: boolean | undefined) {
-  return join(cache_root, platform + "-" + arch + (is_canary ? "-canary" : ""));
+export function storeRoot(platform: Platform, name: string, is_canary: boolean | undefined) {
+  return join(cache_root, platform + "-" + name + (is_canary ? "-canary" : ""));
 }
 
 export async function temp() {
@@ -43,12 +50,6 @@ export async function temp() {
 
 const in_progress_downloads = new AsyncMutexMap<DebugInfo>();
 
-const map_download_arch = {
-  x86_64: "x64",
-  x86_64_baseline: "x64-baseline",
-  aarch64: "aarch64",
-} as const;
-
 const map_download_os = {
   windows: "windows",
   macos: "darwin",
@@ -58,9 +59,10 @@ const map_download_os = {
 
 /**
  * The debug file to symbolize a trace with. Without a `debug_id` (trace
- * formats 1-3) that is the artifact named by the trace's arch, as it always
- * was. With one, the artifact is checked against it and the commit's sibling
- * links are tried when it does not match; see `selectDebugFile`.
+ * formats 1-3) that is the plain build of the trace's arch, as it always was.
+ * With one, that build is checked against it and the commit's other builds
+ * with the same platform char are tried when it does not match; see
+ * `selectDebugFile`.
  */
 export async function fetchDebugFile(
   os: Platform,
@@ -69,14 +71,15 @@ export async function fetchDebugFile(
   is_canary: boolean | undefined,
   debug_id?: string,
 ): Promise<SelectedDebugInfo> {
-  return selectDebugFile(arch, debug_id, (candidate) =>
-    fetchArtifact(os, candidate, commit, is_canary),
+  return selectDebugFile(os, arch, debug_id, (link) =>
+    fetchArtifact(os, arch, link, commit, is_canary),
   );
 }
 
 async function fetchArtifact(
   os: Platform,
   arch: Arch,
+  link: Link,
   commit: ResolvedCommit,
   is_canary: boolean | undefined,
 ): Promise<DebugInfo> {
@@ -84,31 +87,33 @@ async function fetchArtifact(
   assert(oid.length === 40);
 
   const store_suffix = os === "windows" ? ".pdb" : "";
-  const root = storeRoot(os, arch, is_canary);
-  const path = join(root, oid[0], oid + store_suffix);
+  const name = cacheName(os, arch, link);
+  const path = join(storeRoot(os, name, is_canary), oid[0], oid + store_suffix);
 
   return in_progress_downloads.get(path, () =>
-    fetchDebugFileWithoutCache(os, arch, commit, is_canary, store_suffix, path),
+    fetchDebugFileWithoutCache(os, name, link, commit, is_canary, store_suffix, path),
   );
 }
 
 async function fetchDebugFileWithoutCache(
   os: Platform,
-  arch: Arch,
+  name: string,
+  link: Link,
   commit: ResolvedCommit,
   is_canary: boolean | undefined,
   store_suffix: string,
   path: string,
 ): Promise<DebugInfo> {
   const oid = commit.oid;
+  const variant = linkVariant(link);
 
-  const cached = getCachedDebugFile(os, arch, oid);
+  const cached = getCachedDebugFile(os, name, oid);
   if (cached) {
     const feature_config = getCachedFeatureData(oid, is_canary)!;
     return {
       file_path: cached.file_path,
       feature_config: feature_config,
-      arch,
+      variant,
       debug_id: cached.debug_id,
     };
   }
@@ -124,14 +129,13 @@ async function fetchDebugFileWithoutCache(
 
   try {
     if (process.env.NODE_ENV === "development") {
-      console.log("fetching debug file for", os, arch, oid);
+      console.log("fetching debug file for", os, link, oid);
     }
 
     const download_os = map_download_os[os];
-    const download_arch = map_download_arch[arch];
 
     using tmp = await temp();
-    const dir = `bun-${download_os}-${download_arch}-profile`;
+    const dir = `bun-${download_os}-${link}-profile`;
     const url = `${process.env.BUN_DOWNLOAD_BASE}/${commit.oid}${is_canary ? "-canary" : ""}/${dir}.zip`;
     console.log(url);
 
@@ -140,13 +144,13 @@ async function fetchDebugFileWithoutCache(
       const pr = commit.pr;
       if (pr) {
         if (process.env.NODE_ENV === "development") {
-          console.log("fetching debug file for", os, arch, oid, "from PR", pr.number);
+          console.log("fetching debug file for", os, link, oid, "from PR", pr.number);
         }
         try {
-          let success = await tryFromPR(os, arch, commit, tmp.path, is_canary);
+          let success = await tryFromPR(os, link, commit, tmp.path, is_canary);
           if (!success) {
             const err: any = new Error(
-              `Failed to fetch debug file for ${os}-${arch} for PR ${pr.number}`,
+              `Failed to fetch debug file for ${os}-${link} for PR ${pr.number}`,
             );
             err.code = "DebugInfoUnavailable";
             throw err;
@@ -156,7 +160,7 @@ async function fetchDebugFileWithoutCache(
         }
       } else {
         const err: any = new Error(
-          `Failed to fetch debug file for ${os}-${arch} for commit ${commit.oid}`,
+          `Failed to fetch debug file for ${os}-${link} for commit ${commit.oid}`,
         );
         err.code = "DebugInfoUnavailable";
         throw err;
@@ -224,7 +228,7 @@ async function fetchDebugFileWithoutCache(
     feature_config ??=
       getCachedFeatureData(oid, is_canary) ?? (await fetchFeatureData(oid, is_canary));
 
-    putCachedDebugFile(os, arch, oid, path, debug_id);
+    putCachedDebugFile(os, name, oid, path, debug_id);
   } catch (e) {
     await rm(path, { force: true });
     throw e;
@@ -233,14 +237,14 @@ async function fetchDebugFileWithoutCache(
   return {
     file_path: path,
     feature_config,
-    arch,
+    variant,
     debug_id,
   };
 }
 
 export async function tryFromPR(
   os: Platform,
-  arch: Arch,
+  link: Link,
   commit: ResolvedCommit,
   temp: string,
   is_canary: boolean | undefined,
@@ -251,7 +255,6 @@ export async function tryFromPR(
   assert(pr);
 
   const download_os = map_download_os[os];
-  const download_arch = map_download_arch[arch];
 
   const data_1 = await octokit.rest.actions.listWorkflowRunsForRepo({
     owner: "oven-sh",
@@ -287,7 +290,7 @@ export async function tryFromPR(
     per_page: 100, // Fetch up to 100 artifacts
   });
 
-  const dir = `bun-${download_os}-${download_arch}-profile`;
+  const dir = `bun-${download_os}-${link}-profile`;
 
   {
     const artifact = artifacts.data.artifacts.find((artifact) => artifact.name === dir);

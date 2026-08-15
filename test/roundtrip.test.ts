@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { parse } from "../lib/parser";
-import { buildTraceString, encodeVlq, type BuildTraceOpts } from "./helpers/encode";
+import { buildTraceString, encodeHeader, encodeVlq, type BuildTraceOpts } from "./helpers/encode";
 import { decodePart } from "../lib/vlq";
 import { parseCacheKey } from "../lib/util";
 
@@ -286,7 +286,7 @@ describe("parse(buildTraceString(x)) recovers x", () => {
   }
 });
 
-describe("v4 debug id field", () => {
+describe("v4 header", () => {
   const base = {
     version: "1.4.0",
     os: "linux",
@@ -298,27 +298,64 @@ describe("v4 debug id field", () => {
     addresses: [{ address: 0x42, object: "bun" }],
     reason: { kind: "oom" },
   } as const satisfies BuildTraceOpts;
+  const id = "00112233445566778899aabbccddeeff";
 
-  test("a truncated id is rejected rather than read into the following fields", async () => {
-    const full = buildTraceString({ ...base, debug_id: "00112233445566778899aabbccddeeff" });
-    // Drop two hex digits: the declared count (16 bytes) now overruns into the
-    // features VLQs, which are not hex.
-    const cut = full.replace("ccddeeff", "ccddee");
-    expect(await parse(cut)).toBeNull();
+  /** `base` with a hand-written header in place of the one the helper writes. */
+  function withHeader(header: string): string {
+    const generated = encodeHeader(base);
+    const full = buildTraceString(base);
+    const at = full.indexOf(generated, full.indexOf("/") + 1);
+    return full.slice(0, at) + header + full.slice(at + generated.length);
+  }
+
+  test("fields with tags this decoder does not know are skipped", async () => {
+    const p = await parse(
+      buildTraceString({
+        ...base,
+        build_flags: 1,
+        debug_id: id,
+        extra_header_fields: [
+          [7, "anything/goes+here_9"],
+          [300, ""],
+        ],
+      }),
+    );
+    expect(p).toMatchObject({ is_canary: true, debug_id: id, commitish: base.commitish });
+    expect(p!.addresses).toEqual([{ address: 0x42, object: "bun" }]);
+    expect(p!.message).toBe("Bun ran out of memory");
   });
 
-  test("non-hex where the id should be is rejected", async () => {
-    const s = buildTraceString({ ...base, debug_id: "00112233445566778899aabbccddeeff" }).replace("aabb", "AABB");
-    expect(await parse(s)).toBeNull();
+  test("field order does not matter", async () => {
+    const header = encodeVlq(2) + encodeVlq(1) + encodeVlq(id.length) + id + encodeVlq(0) + encodeVlq(1) + encodeVlq(1);
+    expect(await parse(withHeader(header))).toMatchObject({ is_canary: true, debug_id: id });
   });
 
-  test("an absurd byte count is rejected", async () => {
-    // Same layout as the helper writes, but with a hand-written count.
-    const prefix = "1.4.0/la4" + base.commitish + encodeVlq(0);
-    expect(await parse(prefix + encodeVlq(100) + "00".repeat(100) + encodeVlq(0) + encodeVlq(0) + encodeVlq(0) + "9")).toBeNull();
+  test("a header with only build flags means the executable has no id", async () => {
+    const p = await parse(buildTraceString({ ...base, build_flags: 1 }));
+    expect(p).toMatchObject({ is_canary: true });
+    expect(p!.debug_id).toBeUndefined();
   });
 
-  test("is_canary comes from the build flags", async () => {
+  test("a field length running past the end of the string is rejected", async () => {
+    expect(await parse(withHeader(encodeVlq(1) + encodeVlq(1) + encodeVlq(5000) + "0011"))).toBeNull();
+  });
+
+  test("an absurd field count is rejected", async () => {
+    expect(await parse(withHeader(encodeVlq(100000)))).toBeNull();
+  });
+
+  test("a malformed debug id field is rejected", async () => {
+    for (const bad of ["abc", "AABBCCDD", "", "zz".repeat(8)]) {
+      expect(await parse(buildTraceString({ ...base, debug_id: bad }))).toBeNull();
+    }
+  });
+
+  test("a build flags field that is not exactly one VLQ is rejected", async () => {
+    expect(await parse(withHeader(encodeVlq(1) + encodeVlq(0) + encodeVlq(2) + "AA"))).toBeNull();
+    expect(await parse(withHeader(encodeVlq(1) + encodeVlq(0) + encodeVlq(0)))).toBeNull();
+  });
+
+  test("is_canary comes from the build flags field", async () => {
     expect((await parse(buildTraceString({ ...base, build_flags: 1 })))!.is_canary).toBe(true);
     expect((await parse(buildTraceString({ ...base, build_flags: 0 })))!.is_canary).toBe(false);
   });

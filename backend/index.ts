@@ -250,7 +250,7 @@ async function postRemap(request: Request, server: Server<unknown>) {
       command: remapped.command,
       version: remapped.version,
       features: remapped.features,
-      arch: remapped.arch,
+      ...(remapped.variant ? { variant: remapped.variant } : {}),
       ...(remapped.debug_file ? { debug_file: remapped.debug_file } : {}),
     } satisfies RemapAPIResponse);
   } catch (e) {

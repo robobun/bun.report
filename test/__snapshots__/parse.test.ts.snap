@@ -8627,7 +8627,7 @@ exports[`parse fixtures v3-linux-x86_64-segfault-registers 1`] = `
 }
 `;
 
-exports[`parse fixtures v4-linux-x86_64-panic-debug-id: real trace from a linux x64 debug build of oven-sh/bun#38838 (canary flag set; the 20-byte id is the binary's GNU build-id as printed by readelf -n) 1`] = `
+exports[`parse fixtures v4-linux-x86_64-panic-debug-id: real trace from a linux x64 debug build of oven-sh/bun#38838 (header: build flags = canary, then the 20-byte GNU build-id exactly as readelf -n prints it) 1`] = `
 {
   "addresses": [
     {
@@ -8659,27 +8659,27 @@ exports[`parse fixtures v4-linux-x86_64-panic-debug-id: real trace from a linux 
       "object": "?",
     },
     {
-      "address": 334254303,
+      "address": 334255327,
       "object": "bun",
     },
     {
-      "address": 334102908,
+      "address": 334103932,
       "object": "bun",
     },
     {
-      "address": 381823109,
+      "address": 381824133,
       "object": "bun",
     },
     {
-      "address": 381824323,
+      "address": 381825347,
       "object": "bun",
     },
     {
-      "address": 391953016,
+      "address": 391954040,
       "object": "bun",
     },
     {
-      "address": 391954698,
+      "address": 391955722,
       "object": "bun",
     },
     {
@@ -8697,8 +8697,8 @@ exports[`parse fixtures v4-linux-x86_64-panic-debug-id: real trace from a linux 
   ],
   "arch": "x86_64",
   "command": "a",
-  "commitish": "2c2ef7c",
-  "debug_id": "caac16c6401beba3fdd7e29cafe9bd212a0a23f8",
+  "commitish": "e65f750",
+  "debug_id": "e2217c82decf60268399d61b412999385c762757",
   "features": [
     96,
     1048641,
@@ -8710,7 +8710,7 @@ exports[`parse fixtures v4-linux-x86_64-panic-debug-id: real trace from a linux 
 }
 `;
 
-exports[`parse fixtures v4-windows-x86_64-segfault-debug-id: real trace from the windows x64 release build of oven-sh/bun#38838 in CI (canary; the 16-byte id is the PDB GUID {E4509F66-F3B4-E498-4C4C-44205044422E}; foreign KERNEL32/ntdll frames follow the bun frames) 1`] = `
+exports[`parse fixtures v4-windows-x86_64-segfault-debug-id: frames/features/reason from a real crash of the windows x64 release build of oven-sh/bun#38838 in CI, header re-encoded in the final layout (canary; the 16-byte id is the binary PDB GUID {E4509F66-F3B4-E498-4C4C-44205044422E}; foreign KERNEL32/ntdll frames follow the bun frames) 1`] = `
 {
   "addresses": [
     {

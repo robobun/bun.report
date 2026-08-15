@@ -2,8 +2,14 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readExecutableDebugId, selectDebugFile } from "../backend/debug-id";
-import type { Arch } from "../lib/util";
+import {
+  cacheName,
+  linkVariant,
+  publishedLinks,
+  readExecutableDebugId,
+  selectDebugFile,
+  type Link,
+} from "../backend/debug-id";
 
 const dir = mkdtempSync(join(tmpdir(), "bun-report-debug-id-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -160,132 +166,220 @@ describe("readExecutableDebugId", () => {
   });
 });
 
+describe("publishedLinks", () => {
+  test("the builds that share a platform char, plain one first", () => {
+    expect(publishedLinks("linux", "x86_64")).toEqual([
+      "x64",
+      "x64-musl",
+      "x64-android",
+      "x64-baseline",
+    ]);
+    expect(publishedLinks("linux", "aarch64")).toEqual([
+      "aarch64",
+      "aarch64-musl",
+      "aarch64-android",
+    ]);
+    expect(publishedLinks("windows", "x86_64")).toEqual(["x64", "x64-baseline"]);
+    expect(publishedLinks("macos", "x86_64")).toEqual(["x64", "x64-baseline"]);
+    expect(publishedLinks("macos", "aarch64")).toEqual(["aarch64"]);
+    expect(publishedLinks("windows", "aarch64")).toEqual(["aarch64"]);
+    expect(publishedLinks("freebsd", "x86_64")).toEqual(["x64"]);
+    // The old baseline platform chars: their own build first, as before.
+    expect(publishedLinks("linux", "x86_64_baseline")).toEqual([
+      "x64-baseline",
+      "x64-musl",
+      "x64-android",
+      "x64",
+    ]);
+    expect(publishedLinks("windows", "x86_64_baseline")).toEqual(["x64-baseline", "x64"]);
+  });
+
+  test("linkVariant", () => {
+    expect(linkVariant("x64")).toBeUndefined();
+    expect(linkVariant("aarch64")).toBeUndefined();
+    expect(linkVariant("x64-musl")).toBe("musl");
+    expect(linkVariant("aarch64-android")).toBe("android");
+    expect(linkVariant("x64-baseline")).toBe("baseline");
+  });
+});
+
 describe("selectDebugFile", () => {
   interface Info {
-    arch: Arch;
+    link: Link;
     debug_id: string | undefined;
   }
-  const A = "aa".repeat(16);
-  const B = "bb".repeat(16);
+  const GLIBC = "aa".repeat(20);
+  const MUSL = "bb".repeat(20);
+  const ANDROID = "cc".repeat(20);
+  const OTHER = "dd".repeat(20);
 
-  function unavailable(arch: Arch): Error & { code: string } {
-    return Object.assign(new Error(`no artifact for ${arch}`), { code: "DebugInfoUnavailable" });
+  function unavailable(link: Link): Error & { code: string } {
+    return Object.assign(new Error(`no artifact for ${link}`), { code: "DebugInfoUnavailable" });
   }
 
-  /** `store` maps each published arch to the id its executable carries (undefined = unreadable). */
-  function bucket(store: Partial<Record<Arch, string | undefined | Error>>) {
-    const fetched: Arch[] = [];
-    const fetch = async (arch: Arch): Promise<Info> => {
-      fetched.push(arch);
-      if (!(arch in store)) throw unavailable(arch);
-      const entry = store[arch];
+  /** `published` maps each link the commit has to the id its executable carries (undefined = unreadable). */
+  function bucket(published: Record<Link, string | undefined | Error>) {
+    const fetched: Link[] = [];
+    const fetch = async (link: Link): Promise<Info> => {
+      fetched.push(link);
+      if (!(link in published)) throw unavailable(link);
+      const entry = published[link];
       if (entry instanceof Error) throw entry;
-      return { arch, debug_id: entry };
+      return { link, debug_id: entry };
     };
     return { fetch, fetched };
   }
+  const upstream_linux = {
+    x64: GLIBC,
+    "x64-musl": MUSL,
+    "x64-android": ANDROID,
+    "x64-baseline": GLIBC,
+  };
 
-  test("a trace without an id uses its own arch unchecked, as before", async () => {
-    const { fetch, fetched } = bucket({ x86_64: A, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", undefined, fetch)).toEqual({
-      arch: "x86_64",
-      debug_id: A,
+  test("a trace without an id uses the plain build unchecked, as before", async () => {
+    const { fetch, fetched } = bucket(upstream_linux);
+    expect(await selectDebugFile("linux", "x86_64", undefined, fetch)).toEqual({
+      link: "x64",
+      debug_id: GLIBC,
     });
-    expect(fetched).toEqual(["x86_64"]);
+    expect(fetched).toEqual(["x64"]);
   });
 
-  test("a trace without an id still fails when its own arch is missing", async () => {
-    const { fetch } = bucket({ x86_64_baseline: B });
-    await expect(selectDebugFile("x86_64", undefined, fetch)).rejects.toMatchObject({
+  test("a trace without an id still fails when the plain build is missing", async () => {
+    const { fetch } = bucket({ "x64-musl": MUSL });
+    await expect(selectDebugFile("linux", "x86_64", undefined, fetch)).rejects.toMatchObject({
       code: "DebugInfoUnavailable",
     });
   });
 
-  test("the trace's own arch carries the id", async () => {
-    const { fetch, fetched } = bucket({ x86_64: A, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", A, fetch)).toEqual({
-      arch: "x86_64",
-      debug_id: A,
-      debug_file: "match",
+  test("an old baseline platform char without an id uses the baseline build, as before", async () => {
+    const { fetch, fetched } = bucket(upstream_linux);
+    expect(await selectDebugFile("linux", "x86_64_baseline", undefined, fetch)).toEqual({
+      link: "x64-baseline",
+      debug_id: GLIBC,
     });
-    expect(fetched).toEqual(["x86_64"]);
+    expect(fetched).toEqual(["x64-baseline"]);
   });
 
-  test("the other x64 link carries the id (the bun-windows-x64 vs -baseline case)", async () => {
-    const { fetch, fetched } = bucket({ x86_64: A, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", B, fetch)).toEqual({
-      arch: "x86_64_baseline",
-      debug_id: B,
+  test("the plain build carries the id", async () => {
+    const { fetch, fetched } = bucket(upstream_linux);
+    expect(await selectDebugFile("linux", "x86_64", GLIBC, fetch)).toEqual({
+      link: "x64",
+      debug_id: GLIBC,
       debug_file: "match",
     });
-    expect(fetched).toEqual(["x86_64", "x86_64_baseline"]);
+    expect(fetched).toEqual(["x64"]);
   });
 
-  test("works in the other direction too", async () => {
-    const { fetch } = bucket({ x86_64: A, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64_baseline", A, fetch)).toMatchObject({
-      arch: "x86_64",
+  test("a musl trace (reports 'l' like glibc) is matched to the musl build", async () => {
+    const { fetch, fetched } = bucket(upstream_linux);
+    expect(await selectDebugFile("linux", "x86_64", MUSL, fetch)).toEqual({
+      link: "x64-musl",
+      debug_id: MUSL,
       debug_file: "match",
     });
+    expect(fetched).toEqual(["x64", "x64-musl"]);
   });
 
-  test("no published link carries the id: the trace's own arch, flagged mismatch", async () => {
-    const { fetch } = bucket({ x86_64: A, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", "cc".repeat(16), fetch)).toEqual({
-      arch: "x86_64",
-      debug_id: A,
+  test("an android trace is matched to the android build", async () => {
+    const { fetch, fetched } = bucket({
+      aarch64: GLIBC,
+      "aarch64-musl": MUSL,
+      "aarch64-android": ANDROID,
+    });
+    expect(await selectDebugFile("linux", "aarch64", ANDROID, fetch)).toMatchObject({
+      link: "aarch64-android",
+      debug_file: "match",
+    });
+    expect(fetched).toEqual(["aarch64", "aarch64-musl", "aarch64-android"]);
+  });
+
+  test("a trace from a tree that builds a separate baseline binary (the bun-windows-x64 vs -baseline case)", async () => {
+    const baseline = "ee".repeat(16);
+    const { fetch, fetched } = bucket({ x64: "ff".repeat(16), "x64-baseline": baseline });
+    expect(await selectDebugFile("windows", "x86_64", baseline, fetch)).toEqual({
+      link: "x64-baseline",
+      debug_id: baseline,
+      debug_file: "match",
+    });
+    expect(fetched).toEqual(["x64", "x64-baseline"]);
+  });
+
+  test("no published build carries the id: the plain build, flagged mismatch, after trying them all", async () => {
+    const { fetch, fetched } = bucket(upstream_linux);
+    expect(await selectDebugFile("linux", "x86_64", OTHER, fetch)).toEqual({
+      link: "x64",
+      debug_id: GLIBC,
+      debug_file: "mismatch",
+    });
+    expect(fetched).toEqual(["x64", "x64-musl", "x64-android", "x64-baseline"]);
+  });
+
+  test("builds the commit was not published as are skipped, not errors", async () => {
+    const { fetch } = bucket({ x64: GLIBC });
+    expect(await selectDebugFile("linux", "x86_64", OTHER, fetch)).toMatchObject({
+      link: "x64",
       debug_file: "mismatch",
     });
   });
 
-  test("a missing sibling is skipped, not an error", async () => {
-    const { fetch } = bucket({ x86_64: A });
-    expect(await selectDebugFile("x86_64", B, fetch)).toMatchObject({
-      arch: "x86_64",
-      debug_file: "mismatch",
-    });
-  });
-
-  test("an arch with no siblings goes straight to mismatch", async () => {
-    const { fetch, fetched } = bucket({ aarch64: A });
-    expect(await selectDebugFile("aarch64", B, fetch)).toMatchObject({
-      arch: "aarch64",
+  test("an arch with a single build goes straight to mismatch", async () => {
+    const { fetch, fetched } = bucket({ aarch64: GLIBC });
+    expect(await selectDebugFile("macos", "aarch64", OTHER, fetch)).toMatchObject({
+      link: "aarch64",
       debug_file: "mismatch",
     });
     expect(fetched).toEqual(["aarch64"]);
   });
 
-  test("an artifact whose executable has no readable id is used unverified", async () => {
-    const { fetch, fetched } = bucket({ x86_64: undefined, x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", B, fetch)).toEqual({
-      arch: "x86_64",
+  test("a plain build whose executable has no readable id is used unverified", async () => {
+    const { fetch, fetched } = bucket({ x64: undefined, "x64-musl": MUSL });
+    expect(await selectDebugFile("linux", "x86_64", MUSL, fetch)).toEqual({
+      link: "x64",
       debug_id: undefined,
       debug_file: "unverified",
     });
-    expect(fetched).toEqual(["x86_64"]);
+    expect(fetched).toEqual(["x64"]);
   });
 
-  test("the trace's own arch was never published but a sibling carrying the id was", async () => {
-    const { fetch } = bucket({ x86_64_baseline: B });
-    expect(await selectDebugFile("x86_64", B, fetch)).toMatchObject({
-      arch: "x86_64_baseline",
+  test("the plain build was never published but another build carrying the id was", async () => {
+    const { fetch } = bucket({ "x64-musl": MUSL });
+    expect(await selectDebugFile("linux", "x86_64", MUSL, fetch)).toMatchObject({
+      link: "x64-musl",
       debug_file: "match",
     });
   });
 
-  test("nothing published at all reports the trace's own arch as unavailable", async () => {
+  test("nothing published at all reports the plain build as unavailable", async () => {
     const { fetch } = bucket({});
-    await expect(selectDebugFile("x86_64", B, fetch)).rejects.toMatchObject({
+    await expect(selectDebugFile("linux", "x86_64", MUSL, fetch)).rejects.toMatchObject({
       code: "DebugInfoUnavailable",
-      message: "no artifact for x86_64",
+      message: "no artifact for x64",
     });
   });
 
   test("errors other than a missing artifact propagate", async () => {
     const boom = new Error("unzip exploded");
-    await expect(selectDebugFile("x86_64", B, bucket({ x86_64: boom }).fetch)).rejects.toBe(boom);
     await expect(
-      selectDebugFile("x86_64", B, bucket({ x86_64: A, x86_64_baseline: boom }).fetch),
+      selectDebugFile("linux", "x86_64", MUSL, bucket({ x64: boom }).fetch),
     ).rejects.toBe(boom);
+    await expect(
+      selectDebugFile("linux", "x86_64", MUSL, bucket({ x64: GLIBC, "x64-musl": boom }).fetch),
+    ).rejects.toBe(boom);
+  });
+});
+
+describe("cacheName", () => {
+  test("the plain build keeps the name the cache always used; other builds get their own", () => {
+    expect(cacheName("linux", "x86_64", "x64")).toBe("x86_64");
+    expect(cacheName("linux", "aarch64", "aarch64")).toBe("aarch64");
+    expect(cacheName("linux", "x86_64_baseline", "x64-baseline")).toBe("x86_64_baseline");
+    expect(cacheName("linux", "x86_64", "x64-musl")).toBe("x86_64-x64-musl");
+    expect(cacheName("windows", "x86_64", "x64-baseline")).toBe("x86_64-x64-baseline");
+    // The two directions of the baseline pair must not share an entry.
+    expect(cacheName("linux", "x86_64_baseline", "x64")).toBe("x86_64_baseline-x64");
+    expect(
+      new Set(publishedLinks("linux", "x86_64").map((l) => cacheName("linux", "x86_64", l))).size,
+    ).toBe(4);
   });
 });

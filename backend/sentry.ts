@@ -62,8 +62,6 @@ function getTags(parse: Parse, remap: Remap): any {
 
   tags.version = remap.version;
   tags.commit = remap.commit.oid.slice(0, 9);
-  // remap.arch, not parse.arch: for a v4 trace it is the link whose debug
-  // info actually carried the trace's debug id (see debug-store.ts).
   tags.arch = remap.arch.replace(/_baseline$/, "");
   // cache_key is SHA256(commitish_arch_os_canary_addresses). Before the
   // randomUUID switch, MD5(cache_key) was the event_id — so Sentry deduped
@@ -79,9 +77,11 @@ function getTags(parse: Parse, remap: Remap): any {
     tags[feature] = true;
   }
 
-  if (remap.arch.endsWith("_baseline")) {
-    tags.baseline = true;
-  }
+  // Which of the commit's builds the frames were remapped with (musl,
+  // android, baseline); see Remap.variant.
+  const variant = buildDist(remap);
+  if (variant) tags.variant = variant;
+  if (variant === "baseline") tags.baseline = true;
 
   if (parse.is_canary) tags.canary = true;
 
@@ -97,11 +97,14 @@ function getTags(parse: Parse, remap: Remap): any {
 
 /**
  * `dist` marks build variants of the same release — same version, same commit,
- * different compile flags. For bun that's baseline (older-CPU target) and musl
- * (Alpine/musl libc). undefined means the standard build for this os/arch.
+ * different compile flags. For bun that's musl (Alpine), android, and baseline
+ * (older-CPU target). undefined means the standard build for this os/arch.
+ * Until traces carried a debug id only baseline was knowable (it had its own
+ * platform chars); musl and android come from which build the id matched.
  */
 function buildDist(remap: Remap): string | undefined {
-  return remap.arch.endsWith("_baseline") ? "baseline" : undefined;
+  // Remaps cached before `variant` existed only know about baseline, via the arch.
+  return remap.variant ?? (remap.arch.endsWith("_baseline") ? "baseline" : undefined);
 }
 
 function getOSContext(parse: Parse): Sentry.OS {

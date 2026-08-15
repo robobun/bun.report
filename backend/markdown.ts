@@ -5,7 +5,7 @@ import { basename, escmd, escmdcode } from "../lib/util";
 
 export async function formatMarkdown(remap: Remap, internal?: { source: string }): Promise<string> {
   return [
-    `Bun v${remap.version} (${treeURLMD(remap.commit)}) on ${remap.os} ${remap.arch} [${remap.command}]`,
+    `Bun v${remap.version} (${treeURLMD(remap.commit)}) on ${remap.os} ${remap.arch}${remap.variant ? ` (${remap.variant})` : ""} [${remap.command}]`,
     "",
     remap.message.replace(/^panic: /, "**panic**: "),
     "",
@@ -28,7 +28,7 @@ function debugFileNote(remap: Remap): string[] {
   const note = `Debug id: \`${remap.debug_id}\``;
   if (remap.debug_file !== "mismatch") return [note, ""];
   return [
-    `${note} (no published ${remap.os} ${remap.arch} build of this commit has it, so the addresses above are not symbolicated)`,
+    `${note} (none of this commit's published ${remap.os} ${remap.arch} builds has it, so the addresses above are not symbolicated)`,
     "",
   ];
 }
